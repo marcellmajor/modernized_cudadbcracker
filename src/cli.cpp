@@ -71,11 +71,11 @@ void usage() {
       "cudadbcracker search --algorithm ora11g|mssql --input FILE [--charset-classes CLASSES | --charset-hex HEX]\n"
       "    [--min-length N] [--max-length N] [--length N --start-rank DECIMAL --count DECIMAL]\n"
       "    [--mssql-mode auto|uppercase|direct] [--device N] [--tune off|quick|full]\n"
-      "    [--block-size N] [--interleave N] [--batch-candidates N] [--case-budget N]\n"
+      "    [--block-size N] [--interleave N] [--grid-multiplier N] [--batch-candidates N] [--case-budget N]\n"
       "    [--checkpoint FILE] [--results FILE]\n"
       "cudadbcracker resume --checkpoint FILE [--device N] [--tune off|quick|full] [--case-budget N] [--results FILE]\n"
       "cudadbcracker benchmark --algorithm ora11g|mssql --length N --charset-classes CLASSES --count N\n"
-      "    [--repeats N] [--device N] [--block-size N] [--interleave N] [--json FILE]\n";
+      "    [--repeats N] [--device N] [--block-size N] [--interleave N] [--grid-multiplier N] [--json FILE]\n";
 }
 
 int cmdDevices(const Opts& o) {
@@ -182,6 +182,11 @@ LaunchConfig baseConfig(const Opts& o) {
         auto v = parseU64(o.get("interleave"), "--interleave", 4);
         if (v != 1 && v != 2 && v != 4) throw InputError("--interleave must be 1, 2 or 4");
         cfg.interleave = (int)v;
+    }
+    if (o.has("grid-multiplier")) {
+        auto g = parseU64(o.get("grid-multiplier"), "--grid-multiplier", 4096);
+        if (g < 1) throw InputError("--grid-multiplier must be at least 1");
+        cfg.gridMultiplier = (int)g; cfg.gridMultiplierSet = true;
     }
     if (o.has("batch-candidates")) cfg.batchCandidates = parseU64(o.get("batch-candidates"), "--batch-candidates", kMaxBatchCandidates);
     if (cfg.batchCandidates == 0) throw InputError("--batch-candidates must be at least 1");

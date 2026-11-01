@@ -78,6 +78,11 @@ int runSearch(Checkpoint& cp, const std::string& checkpointPath, const std::stri
             LaunchConfig cfg = resolveLaunchConfig(tune, cp.algorithm, L, B, device,
                                                    baseCfg.blockSize, baseCfg.interleave,
                                                    baseCfg.batchCandidates, nullptr);
+            if (baseCfg.gridMultiplierSet) cfg.gridMultiplier = baseCfg.gridMultiplier;
+            std::cerr << "launch config: target=" << tgt.label << " length=" << L << " B=" << B
+                      << " block=" << cfg.blockSize << " interleave=" << cfg.interleave
+                      << " grid-multiplier=" << cfg.gridMultiplier
+                      << " batch=" << cfg.batchCandidates << " source=" << cfg.source << "\n";
             while (rank.compare(rangeEnd) < 0) {
                 if (g_stopRequested.load()) {
                     st.rank = rank.toDecimal();

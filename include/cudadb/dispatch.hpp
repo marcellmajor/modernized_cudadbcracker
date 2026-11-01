@@ -22,9 +22,10 @@ std::vector<DeviceInfo> listDevices(); // empty when unavailable
 DeviceInfo requireDevice(int index);   // throws CudaError when unusable
 
 struct LaunchConfig {
-    int blockSize = 128;
+    int blockSize = 256; // measured best on A100 (~1.5% over 128, no regression seen)
     int interleave = 1;
     int gridMultiplier = 32; // blocks per SM target for grid sizing
+    bool gridMultiplierSet = false; // true when the user set it explicitly
     std::uint64_t batchCandidates = 1048576;
     std::string source = "fallback"; // fallback|user|tune-cache|tuned
 };

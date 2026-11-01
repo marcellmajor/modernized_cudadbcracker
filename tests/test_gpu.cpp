@@ -1,6 +1,7 @@
 #include "cudadb/algorithms.hpp"
 #include "cudadb/dispatch.hpp"
 #include "cudadb/enumeration.hpp"
+#include "cudadb/input.hpp"
 #include <iostream>
 using namespace cudadb;
 // Exit 77 = CTest skip (SKIP_RETURN_CODE): no device is reported, not passed.
@@ -62,6 +63,36 @@ int main() {
         LaunchConfig cfg4 = cfg; cfg4.interleave = 4;
         auto gpu4 = gpuSearch(c.a, t, t.digest, alpha, base, count, 0, cfg4);
         if (cpu != gpu4) { std::cerr << "FAIL gpu search (interleave 4) offset mismatch\n"; return 1; }
+    }
+    // Unaligned start rank: base digits [2,1,0] (digit 0 != 0), count
+    // spans the leading partial group, aligned fast groups, and a
+    // trailing partial group in gpuSearch's composition.
+    {
+        Bytes pw{'c','b','c'}; // digits [2,1,2] over {a,b,c}
+        Target t; t.label = "u"; t.salt = saltO; t.digest = digestForCandidate(Algorithm::Oracle11g, pw, saltO);
+        std::vector<std::uint8_t> base{2, 1, 0};
+        // target rank = 2 + 1*3 + 2*9 = 23; base rank = 2 + 1*3 = 5; offset 18.
+        for (int il : {1, 2, 4}) {
+            LaunchConfig c = cfg; c.interleave = il;
+            auto cpu = cpuSearch(Algorithm::Oracle11g, t, t.digest, alpha, base, 20);
+            auto gpu = gpuSearch(Algorithm::Oracle11g, t, t.digest, alpha, base, 20, 0, c);
+            if (!cpu || *cpu != 18 || cpu != gpu) { std::cerr << "FAIL unaligned gpu search il=" << il << "\n"; return 1; }
+        }
+    }
+    // Large rank beyond 2^32: base rank 5,000,000,000 over alphabet 62,
+    // length 6; small local window, target at local offset 3.
+    {
+        Bytes alpha62 = alphabetFromClasses("uln");
+        auto base = rankToDigits("5000000000", 62, 6);
+        auto targetDigits = addOffsetToDigits(base, 62, 3);
+        Bytes pw = candidateFromDigits(targetDigits, alpha62);
+        Target t; t.label = "big"; t.salt = saltO; t.digest = digestForCandidate(Algorithm::Oracle11g, pw, saltO);
+        for (int il : {1, 2}) {
+            LaunchConfig c = cfg; c.interleave = il;
+            auto cpu = cpuSearch(Algorithm::Oracle11g, t, t.digest, alpha62, base, 8);
+            auto gpu = gpuSearch(Algorithm::Oracle11g, t, t.digest, alpha62, base, 8, 0, c);
+            if (!cpu || *cpu != 3 || cpu != gpu) { std::cerr << "FAIL large-rank gpu search il=" << il << "\n"; return 1; }
+        }
     }
     std::cout << "test_gpu passed\n";
     return 0;

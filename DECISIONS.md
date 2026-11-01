@@ -45,7 +45,9 @@ They are recorded here so they can be changed in one place.
     keeps printable ASCII and escapes other bytes as `\xNN`.
 11. **Defaults.** Search lengths 1–8, device 0, tune `quick`,
     case budget 1,048,576, batch 1,048,576 candidates. Tune-off fallback:
-    block 128, interleave 1, grid multiplier 32 blocks/SM. Results go to
+    block 256 (changed from 128 after the A100 measurements showed a
+    consistent ~1.5% advantage with no regression), interleave 1,
+    grid multiplier 32 blocks/SM. Results go to
     stdout unless `--results` is given. No checkpoint is written unless
     `--checkpoint` is given (interruption then reports `(none)`).
 12. **Interleave 4.** Implemented as an opt-in experiment per spec §9.3:
@@ -60,7 +62,18 @@ They are recorded here so they can be changed in one place.
 14. **Tuning cache.** A plain-text cache at `$CUDADB_TUNE_CACHE` or
     `$HOME/.cache/cudadbcracker/tuning.txt`, keyed by device name,
     compute capability, SM count, algorithm, length, and alphabet size.
-15. **Optimisation scope (held items).** Low-risk review refinements were
+15. **Wave-aware grid sizing.** Post-profiling change: kernel launches
+    round the grid down to a whole number of occupancy waves
+    (`cudaOccupancyMaxActiveBlocksPerMultiprocessor` × SM count,
+    never below one wave), because measured launches wasted 20–33%
+    in a partial final wave. Grid-stride loops make this
+    correctness-neutral. The default block size is now 256 (item 11).
+    Early-reject (skipping the five final state additions in
+    single-block paths) remains **deferred**: ~1–2% expected, touches
+    all three verified compression cores, and is only worth doing as
+    its own A100-validated change.
+
+16. **Optimisation scope (held items).** Low-risk review refinements were
     applied source-only (interleave-adjusted grid sizing, interleave-4
     `#pragma unroll`, `digestKernel` single-block coverage); see
     `VERIFICATION.md`. Two items were deliberately deferred:

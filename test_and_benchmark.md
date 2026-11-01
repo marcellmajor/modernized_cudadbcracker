@@ -245,6 +245,96 @@ emits one JSONL record with `status":"found"`,
 
 ---
 
+### 4.4 Compute Sanitizer (spec section 14.3)
+
+Catches out-of-bounds and race defects that offset tests cannot see,
+especially in the interleave-4 and medium-length paths:
+
+```bash
+compute-sanitizer --tool memcheck --launch-timeout 600 ./build/test_gpu 2>&1 | tee sanitizer_memcheck.log
+compute-sanitizer --tool racecheck --launch-timeout 600 ./build/test_gpu 2>&1 | tee sanitizer_racecheck.log
+compute-sanitizer --tool memcheck ./build/cudadbcracker search \
+  --algorithm ora11g --input /tmp/ora_targets.txt --charset-classes l \
+  --length 3 --tune off --device 0 2>&1 | tee sanitizer_search.log
+```
+
+Expected: `ERROR SUMMARY: 0 errors` in every run. Any error is a
+correctness bug — save the full log and stop.
+
+### 4.5 Multi-batch search, SIGINT, and resume
+
+Verifies checkpoint cadence and that interruption neither skips nor
+duplicates candidates. Plant a target near the end of a bounded
+range, interrupt a multi-batch search over it, then resume:
+
+```python
+import hashlib, subprocess, signal, time, pathlib
+
+# password at a known large rank over 'l' (26): choose digits directly
+digits = [0, 0, 0, 0, 0, 0]
+rank = 4_000_000
+r = rank
+for i in range(6):
+    digits[i] = r % 26; r //= 26
+pw = bytes(ord('a') + d for d in digits)
+salt = bytes.fromhex("0102030405060708090a")
+ver = hashlib.sha1(pw + salt).hexdigest().upper() + salt.hex().upper()
+pathlib.Path("/tmp/big_targets.txt").write_text(f"victim:{ver}\n")
+print("planted password:", pw, "rank:", rank)
+
+args = ["./build/cudadbcracker", "search", "--algorithm", "ora11g",
+        "--input", "/tmp/big_targets.txt", "--charset-classes", "l",
+        "--length", "6", "--start-rank", "0", "--count", "5000000",
+        "--batch-candidates", "4096", "--tune", "off", "--device", "0",
+        "--checkpoint", "/tmp/big_ckpt.json", "--results", "/tmp/big_res.jsonl"]
+p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+time.sleep(6)
+p.send_signal(signal.SIGINT)
+out, _ = p.communicate()
+print("interrupted exit:", p.returncode)   # expect 130
+print(pathlib.Path("/tmp/big_ckpt.json").exists())
+
+r2 = subprocess.run(["./build/cudadbcracker", "resume", "--checkpoint", "/tmp/big_ckpt.json",
+                     "--tune", "off", "--device", "0", "--results", "/tmp/big_res.jsonl"],
+                    text=True, capture_output=True)
+print("resume exit:", r2.returncode)
+print(open("/tmp/big_res.jsonl").read())   # expect one found record at rank 4000000
+```
+
+Pass criteria: interrupted exit is 130, the checkpoint exists, resume
+exits 0, and exactly one `found` record appears whose `rank` equals
+the planted rank — proving no candidate was skipped or repeated
+across the interruption boundary.
+
+### 4.6 MSSQL dual-digest smoke (uppercase search + case recovery)
+
+The 4.3 smoke test covers Oracle direct search only. This one covers
+the MSSQL dual path end to end through the CLI:
+
+```python
+import hashlib, subprocess, pathlib
+
+salt = bytes.fromhex("0a0b0c0d")
+def enc(s): return b"".join(bytes([c, 0]) for c in s.encode())
+mixed, upper = "aB3c", "AB3C"
+ver = ("0x0100" + salt.hex()
+       + hashlib.sha1(enc(mixed) + salt).hexdigest()
+       + hashlib.sha1(enc(upper) + salt).hexdigest())
+pathlib.Path("/tmp/ms_targets.txt").write_text(f"bob:{ver}\n")
+
+r = subprocess.run(["./build/cudadbcracker", "search", "--algorithm", "mssql",
+                    "--input", "/tmp/ms_targets.txt", "--charset-classes", "un",
+                    "--length", "4", "--mssql-mode", "auto", "--tune", "off",
+                    "--device", "0", "--results", "/tmp/ms_res.jsonl"],
+                   text=True, capture_output=True)
+print("exit:", r.returncode)
+print(open("/tmp/ms_res.jsonl").read())
+```
+
+Expected: one record with `status":"found"` and
+`password_hex":"61423363"` (`aB3c`) — i.e. the GPU found the
+uppercase form and CPU case recovery restored the exact case.
+
 ## 5. Benchmark (permitted runtime only)
 
 Rules from the specification (section 15): a complete-work benchmark
@@ -312,6 +402,62 @@ Record how long tuning took and which configuration it selected.
 
 ---
 
+### 5.5 Grid wave-multiple sweep (validates wave-aware grid sizing)
+
+After the wave-aware grid change, grids snap to whole occupancy
+waves. Quantify it by sweeping the grid multiplier around the old
+3,456-block launch (108 SMs) at interleave 2 / block 128, before and
+after the change (two commits, same everything else):
+
+```python
+import subprocess
+for gm in (30, 32, 40):   # caps: 3240 / 3456 / 4320 blocks pre-change
+    r = subprocess.run(["./build/cudadbcracker", "benchmark", "--algorithm", "ora11g",
+                        "--length", "8", "--charset-classes", "uln", "--count", "16777216",
+                        "--repeats", "5", "--device", "0", "--block-size", "128",
+                        "--interleave", "2", "--grid-multiplier", str(gm)],
+                       text=True, capture_output=True)
+    print("grid-multiplier", gm, r.stdout.strip() or r.stderr.strip())
+```
+
+Report both commits' numbers with the full context block. A wave
+multiple that removes the 25% tail should show up directly here.
+
+### 5.6 End-to-end vs device-only rate
+
+All Section 8 numbers so far are device-event timing. Measure the
+end-to-end rate a user actually sees, at the default-ish batch, by
+timing a no-hit fixed-range search wall-clock (use a target file
+whose password lies outside the searched range, e.g. one generated
+for `zzzzzz`, whose rank exceeds the 50M count below):
+
+```bash
+time ./build/cudadbcracker search --algorithm ora11g --input /tmp/nohit_targets.txt \
+  --charset-classes l --length 6 --start-rank 0 --count 50000000 \
+  --batch-candidates 1048576 --tune off --device 0 \
+  --checkpoint /tmp/e2e_ckpt.json --results /tmp/e2e_res.jsonl
+# end-to-end hashes/s = 50,000,000 / wall seconds; compare with the
+# device-only benchmark rate at the same length/alphabet.
+```
+
+The gap is host serialisation (checkpoint write + result read per
+batch). If it is material at 2^20 batches, double-buffering becomes
+worth revisiting; if not, close that question with the number.
+
+### 5.7 Alphabet-size sweep
+
+Group amortisation depends on B (fast kernel processes B candidates
+per prepared group). Sweep B = 10 / 26 / 36 / 62 at length 8,
+interleave 2 (36 is the MSSQL `un` uppercase-mode alphabet):
+
+```bash
+for CS in n l un uln; do
+  ./build/cudadbcracker benchmark --algorithm ora11g --length 8 \
+    --charset-classes $CS --count 16777216 --repeats 5 --device 0 \
+    --block-size 256 --interleave 2
+done
+```
+
 ## 6. CUDA profiling (permitted runtime only)
 
 Use Nsight Compute (`ncu`) for per-kernel analysis and Nsight Systems
@@ -371,7 +517,46 @@ Extract: kernel launch count/durations, gaps between launches
 (host-bound time: checkpoint saves, result reads), and memcpy sizes.
 This is where launch overhead and host/device serialisation show up.
 
-### 6.3 What "good" looks like (interpretation guide)
+### 6.4 Nsight Systems on a multi-batch search
+
+Section 6.2 profiles a single benchmark process. This one measures
+the real search loop over many batches — inter-launch gaps are where
+checkpoint writes and result reads would show up:
+
+```bash
+nsys profile --trace=cuda,osrt --stats=true -o timeline_multibatch \
+  ./build/cudadbcracker search --algorithm ora11g --input /tmp/nohit_targets.txt \
+  --charset-classes l --length 6 --start-rank 0 --count 20000000 \
+  --batch-candidates 262144 --tune off --device 0 \
+  --checkpoint /tmp/nsys_ckpt.json --results /tmp/nsys_res.jsonl
+```
+
+Extract: launches per batch, gap distribution between kernel end and
+next launch, and memcpy sizes. Small gaps at 2^18 batches would make
+double-buffering worth testing; negligible gaps close the question.
+
+### 6.5 Nsight Compute on the generic single-block kernel (L17/L25)
+
+All profiling so far is the fast kernel at L8. Profile the generic
+path at the lengths where it takes over, with local-memory metrics,
+to price the medium-length grouped kernel (held item B):
+
+```bash
+for L in 17 25; do
+  ncu --set detailed --launch-skip 1 --launch-count 2 \
+    -o generic_L${L} --force-overwrite \
+    ./build/cudadbcracker benchmark --algorithm ora11g --length $L \
+      --charset-classes uln --count 4194304 --repeats 3 --device 0
+  ncu --import generic_L${L}.ncu-rep --csv --metrics \
+    gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__registers_per_thread,l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum
+done
+```
+
+The local load/store sector counts quantify how much of the generic
+kernel's ~45% deficit is its 576-byte stack frame living in local
+memory — that number is the evidence base for scoping item B.
+
+### 6.6 What "good" looks like (interpretation guide)
 
 - Compute throughput near the SM limit with low memory throughput is
   expected — the kernel is integer-ALU-bound by design.

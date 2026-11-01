@@ -3,7 +3,9 @@
 #include "fast_kernel.cuh"
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <map>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace cudadb_cuda {
@@ -17,6 +19,43 @@ cudaStream_t stream() {
     if (!s) check(cudaStreamCreate(&s), "cudaStreamCreate");
     return s;
 }
+// Occupancy/wave helpers (post-A100-profiling change): measured launches
+// wasted 20-33% in a partial final wave, so grids are rounded down to a
+// whole number of occupancy waves for the actual kernel being launched.
+// Grid-stride loops make any grid size correctness-neutral.
+int g_lastRegs = -1;
+std::size_t g_lastShared = 0;
+void recordAttrs(const void* func) {
+    cudaFuncAttributes a{};
+    if (cudaFuncGetAttributes(&a, func) == cudaSuccess) {
+        g_lastRegs = a.numRegs;
+        g_lastShared = a.sharedSizeBytes;
+    }
+}
+int waveFor(const void* func, int blockSize) {
+    static std::map<std::pair<const void*, int>, int> cache;
+    auto key = std::make_pair(func, blockSize);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    int wave = 0;
+    int blocksPerSM = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSM, func, blockSize, 0) == cudaSuccess && blocksPerSM > 0) {
+        int dev = 0, sm = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && sm > 0)
+            wave = blocksPerSM * sm;
+    }
+    cache[key] = wave;
+    return wave;
+}
+int waveAlign(const void* func, int blockSize, int requested) {
+    int wave = waveFor(func, blockSize);
+    recordAttrs(func);
+    if (wave <= 0) return requested;
+    if (requested <= wave) return wave; // never below one full wave
+    return (requested / wave) * wave;
+}
+
 struct ResultBuf {
     std::uint64_t* d = nullptr;
     ResultBuf() { check(cudaMalloc(&d, sizeof(std::uint64_t)), "cudaMalloc result"); }
@@ -27,9 +66,13 @@ struct ResultBuf {
 
 template<int ALGO, int L>
 std::uint64_t launchFastFor(const KernelParams& p, int blockSize, int gridBlocks, int interleave, ResultBuf& rb) {
-    if (interleave == 4) fastSearchKernel<ALGO, L, 4><<<gridBlocks, blockSize, 0, stream()>>>(p, rb.d);
-    else if (interleave == 2) fastSearchKernel<ALGO, L, 2><<<gridBlocks, blockSize, 0, stream()>>>(p, rb.d);
-    else fastSearchKernel<ALGO, L, 1><<<gridBlocks, blockSize, 0, stream()>>>(p, rb.d);
+    const void* kern = interleave == 4 ? (const void*)fastSearchKernel<ALGO, L, 4>
+                     : interleave == 2 ? (const void*)fastSearchKernel<ALGO, L, 2>
+                                       : (const void*)fastSearchKernel<ALGO, L, 1>;
+    int grid = waveAlign(kern, blockSize, gridBlocks);
+    if (interleave == 4) fastSearchKernel<ALGO, L, 4><<<grid, blockSize, 0, stream()>>>(p, rb.d);
+    else if (interleave == 2) fastSearchKernel<ALGO, L, 2><<<grid, blockSize, 0, stream()>>>(p, rb.d);
+    else fastSearchKernel<ALGO, L, 1><<<grid, blockSize, 0, stream()>>>(p, rb.d);
     check(cudaGetLastError(), "fast kernel launch");
     check(cudaStreamSynchronize(stream()), "fast kernel sync");
     return rb.get();
@@ -68,7 +111,8 @@ bool fastEligible(const KernelParams& p, int interleave) {
 
 std::uint64_t runGeneric(const KernelParams& p, int blockSize, int gridBlocks) {
     ResultBuf rb; rb.reset();
-    genericSearchKernel<<<gridBlocks, blockSize, 0, stream()>>>(p, rb.d);
+    int grid = waveAlign((const void*)genericSearchKernel, blockSize, gridBlocks);
+    genericSearchKernel<<<grid, blockSize, 0, stream()>>>(p, rb.d);
     check(cudaGetLastError(), "generic kernel launch");
     check(cudaStreamSynchronize(stream()), "generic kernel sync");
     return rb.get();
@@ -106,12 +150,16 @@ double timeSearchLaunches(const KernelParams& p, int blockSize, int gridBlocks, 
                 default: break;
             }
         }
-        genericSearchKernel<<<gridBlocks, blockSize, 0, stream()>>>(p, rb.d);
+        int grid = waveAlign((const void*)genericSearchKernel, blockSize, gridBlocks);
+        genericSearchKernel<<<grid, blockSize, 0, stream()>>>(p, rb.d);
         check(cudaGetLastError(), "benchmark launch");
         check(cudaStreamSynchronize(stream()), "benchmark sync");
     };
     // Warm-up.
     launchOnce();
+    // Attributes of the kernel actually launched (recorded by waveAlign).
+    if (numRegs) *numRegs = g_lastRegs;
+    if (sharedBytes) *sharedBytes = g_lastShared;
     std::vector<double> secs;
     for (int i = 0; i < repeats; ++i) {
         rb.reset();
@@ -120,7 +168,8 @@ double timeSearchLaunches(const KernelParams& p, int blockSize, int gridBlocks, 
         check(cudaEventRecord(a, stream()), "event record");
         if (fast) { launchFastSwitch(p, blockSize, gridBlocks, interleave, rb); }
         else {
-            genericSearchKernel<<<gridBlocks, blockSize, 0, stream()>>>(p, rb.d);
+            int grid = waveAlign((const void*)genericSearchKernel, blockSize, gridBlocks);
+            genericSearchKernel<<<grid, blockSize, 0, stream()>>>(p, rb.d);
             check(cudaGetLastError(), "benchmark launch");
             check(cudaStreamSynchronize(stream()), "benchmark sync");
         }
