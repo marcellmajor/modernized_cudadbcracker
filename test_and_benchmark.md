@@ -270,9 +270,11 @@ range, interrupt a multi-batch search over it, then resume:
 ```python
 import hashlib, subprocess, signal, time, pathlib
 
-# password at a known large rank over 'l' (26): choose digits directly
+# password at a known large rank over 'l' (26): choose digits directly.
+# (Use a range large enough that the search cannot finish before the
+# SIGINT: a 5M range completed in under 6 s in attempt 1.)
 digits = [0, 0, 0, 0, 0, 0]
-rank = 4_000_000
+rank = 200_000_000
 r = rank
 for i in range(6):
     digits[i] = r % 26; r //= 26
@@ -284,11 +286,11 @@ print("planted password:", pw, "rank:", rank)
 
 args = ["./build/cudadbcracker", "search", "--algorithm", "ora11g",
         "--input", "/tmp/big_targets.txt", "--charset-classes", "l",
-        "--length", "6", "--start-rank", "0", "--count", "5000000",
+        "--length", "6", "--start-rank", "0", "--count", "250000000",
         "--batch-candidates", "4096", "--tune", "off", "--device", "0",
         "--checkpoint", "/tmp/big_ckpt.json", "--results", "/tmp/big_res.jsonl"]
 p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-time.sleep(6)
+time.sleep(3)
 p.send_signal(signal.SIGINT)
 out, _ = p.communicate()
 print("interrupted exit:", p.returncode)   # expect 130
@@ -303,8 +305,8 @@ print(open("/tmp/big_res.jsonl").read())   # expect one found record at rank 400
 
 Pass criteria: interrupted exit is 130, the checkpoint exists, resume
 exits 0, and exactly one `found` record appears whose `rank` equals
-the planted rank — proving no candidate was skipped or repeated
-across the interruption boundary.
+the planted rank (200000000) — proving no candidate was skipped or
+repeated across the interruption boundary.
 
 ### 4.6 MSSQL dual-digest smoke (uppercase search + case recovery)
 
@@ -640,7 +642,10 @@ Environment notes (from the first returned output, `nvidia-smi` +
 | Host tests (`-L host`) | **Passed** (3/3 on the A100 machine) |
 | `devices --json` | **Passed** — A100-SXM4-80GB, cc 8.0, 108 SMs, 84,994,825,984 bytes, max 1024 threads/block |
 | `self-test --extended --device 0` | **Passed** |
-| `ctest -L gpu` / `test_gpu` | **Passed** (0.55 s, after fast-forward to `b775209`). Attempt 1 had failed on a test-case bug — MSSQL case `BA` over a lowercase alphabet with batch 27 > 3² space — fixed in commit `4da1451` (case `ba`, counts bounded by `min(27, 3^L)`); the re-run passes all GPU digest checks (both algorithms, lengths 0–128 incl. multi-block) and all GPU-vs-CPU search-offset checks, including Oracle 17/45, MSSQL 17/25, at interleave 1, 2, and 4. |
+| `ctest -L gpu` / `test_gpu` | **Passed** (0.55 s at `b775209`; **re-validated 0.57 s at `27e8e0c`** after the wave-aware grid change, now including the unaligned start-rank case (lead/aligned/trailing composition) and the >2³² large-rank case — all GPU-vs-CPU offsets match). Attempt 1 had failed on a test-case bug — MSSQL case `BA` over a lowercase alphabet with batch 27 > 3² space — fixed in commit `4da1451` (case `ba`, counts bounded by `min(27, 3^L)`); the runs pass all GPU digest checks (both algorithms, lengths 0–128 incl. multi-block) and all search-offset checks, including Oracle 17/45, MSSQL 17/25, at interleave 1, 2, and 4. Host tests also re-pass (3/3) at `27e8e0c`. |
+| Multi-batch SIGINT + resume (§4.5) | **Passed** (retry at `27e8e0c`). Attempt 1 was inconclusive (5M range finished before the SIGINT; exit 0). The retry over a 250M range, batch 4096, SIGINT at 3 s gave: **interrupted exit 130**, checkpoint exists, resume exit 0, and the found record `{"password_display":"szdrvq","rank":"200000000","verification":"cpu-verified"}` — exactly the planted rank, with no skipped or duplicated candidates across the interruption. (The output file also shows attempt 1's `eeptia` record above it; results files append by design, and this run emitted exactly one new record.) |
+| Compute Sanitizer (memcheck + racecheck) | **Passed** on `test_gpu` at `27e8e0c`: `ERROR SUMMARY: 0 errors`, `RACECHECK SUMMARY: 0 hazards`. No out-of-bounds or shared-memory race in the fast/generic/quad kernels. |
+| MSSQL dual-digest smoke (§4.6) | **Passed.** Search in uppercase mode found the candidate and CPU case recovery restored it: `{"status":"found","password_hex":"61423363","password_display":"aB3c","mode":"uppercase","rank":"130932","verification":"cpu-verified"}` — rank 130932 is exactly canonical for `AB3C` over the 36-symbol `un` alphabet (0 + 1·36 + 29·36² + 2·36³). The same run confirms the new launch-config logging and the block-256 default (`block=256 interleave=1 source=fallback`). |
 | Synthetic search smoke test | **Passed.** `verify --backend both` returned `found` (`verification":"both"`). The full `search` then ran end-to-end with exit 0 and emitted `{"status":"found","password_hex":"636162","password_display":"cab","rank":"678","verification":"cpu-verified"}` — rank 678 is exactly canonical for `cab` over the 26-letter alphabet (2 + 0·26 + 1·26²), so GPU batch search, CPU re-verification of the hit, checkpoint writing, and JSONL reporting all work together. (The first attempt had been interrupted by a notebook paste artifact in the long shell line, unrelated to the code.) |
 
 ### 8.3 Benchmarks
@@ -680,11 +685,11 @@ Conclusions so far:
 - Oracle and MSSQL rates are within ~3% of each other, as expected:
   same block count and round work at length 8, only the packing
   differs.
-- Known reporting gap: the benchmark JSON prints
-  `registers_per_thread: -1` because `timeSearchLaunches` does not
-  query kernel attributes. The build log has the true values; wiring
-  `cudaFuncGetAttributes` into the benchmark record is a small
-  follow-up fix.
+- Reporting gap (fixed in `27e8e0c`): the benchmark JSON originally
+  printed `registers_per_thread: -1`; it now reports the launched
+  kernel's real attributes via `cudaFuncGetAttributes` (verified:
+  48 for the interleave-2 L8 variant). The numbers in the table
+  above predate the fix and took registers from the build log.
 
 ### Length sweep (interleave 2, block 128)
 
@@ -722,6 +727,103 @@ Conclusions:
 - The generic kernel ignores the interleave setting (it has no
   interleaved variant); the `interleave: 2` in these records is the
   requested configuration, not an applied one.
+
+### Grid wave sweep (concluded: neutral on A100)
+
+Attempt 1 was inconclusive: `registers_per_thread` printed -1
+(proving the benchmark executable was stale from the pre-pull build)
+and the gm30 outlier was inconsistent with the wave math. After a
+clean full rebuild at `27e8e0c` (freshness proof:
+`registers_per_thread: 48`, exactly the interleave-2 value; host and
+GPU tests re-passed), the reversed-order sweep gives, Oracle L8 /
+interleave 2 / block 128 / 16,777,216 candidates:
+
+| Grid multiplier | Hashes/s |
+|---|---|
+| 30 | 17.45 GH/s |
+| 32 | 17.34 GH/s |
+| 40 | 17.43 GH/s |
+
+**Verdict: wave-aware grid sizing is performance-neutral at this
+configuration** (all within 0.6%, identical to the 17.45 GH/s
+pre-change baseline). The 20–33% partial-wave tails Nsight flagged
+do not convert into benchmark losses here, because at production
+batch sizes each block grid-strides over many groups, so the final
+partial wave is a small fraction of total work. The change is kept:
+it is correctness-neutral (validated by `test_gpu` at the same
+commit, including the unaligned and large-rank cases), removes a
+real profiler-observed inefficiency class for small launches, and
+costs nothing at large ones. It should not be cited as a speedup.
+
+### End-to-end rate (concluded: host-bound at 2^20 batches)
+
+Attempt 2 (50M candidates) was startup-dominated (0.58 s wall for
+~3 ms of device work) and proved nothing about steady state.
+Attempt 3 used length 8, count 1,000,000,000, batch 2^20 (~954
+batches): **exit 0 in 1.3 s wall = 0.79 GH/s end-to-end**, against
+a measured device-only rate of 17.54 GH/s at the same
+length/alphabet. Device work in that run is only ~57 ms of the
+1.3 s; the remaining ~1.24 s is per-batch host cost — roughly
+**1.3 ms per batch** across ~954 batches (kernel-launch setup
+including a fresh result-buffer allocation per launch, stream
+synchronise + result readback, checkpoint file write/rename, and
+progress output, all serialised with the device idle between
+batches).
+
+Conclusion: **real searches at the default batch size are
+host-bound, reaching only ~4.5% of the device-only rate.** This
+reverses the earlier assumption that host serialisation was a
+minor effect at 2^20 batches. The concrete follow-ups, in expected
+order of value, are: (1) increase the default batch size (device
+time per batch grows linearly, host cost per batch does not);
+(2) stop allocating/freeing the result buffer on every launch;
+(3) make checkpoint writes less frequent or cheaper than a full
+file rewrite per batch; (4) only then consider double-buffering.
+Each must be re-measured end-to-end, not assumed.
+
+**Nsight Systems attribution (multi-batch search, 20M candidates,
+batch 262,144).** Kernel summary: 77 `fastSearchKernel` launches
+(one per batch) averaging 99.9 µs (7.69 ms total, 90.7% of GPU
+time), plus **143 `genericSearchKernel` launches** averaging
+5.5 µs — the leading/trailing partial-group segments of
+`gpuSearch`'s composition, i.e. most batches cost **three kernel
+launches, not one**. API summary (220 launches total) is the
+smoking gun:
+
+| CUDA API | Calls | Avg | Total | Share |
+|---|---|---|---|---|
+| `cudaMalloc` | 220 | 82 µs | 18.1 ms | 34.9% |
+| `cudaFree` | 220 | 65 µs | 14.3 ms | 27.6% |
+| `cudaStreamSynchronize` | 220 | 43 µs | 9.5 ms | 18.2% |
+| `cudaMemcpy` | 440 | 16 µs | 6.9 ms | 13.3% |
+| `cudaLaunchKernel` | 220 | 14 µs | 3.0 ms | 5.8% |
+
+Allocation alone is **62% of CUDA API time** (~147 µs per
+malloc/free pair, one pair per launch, three launches per batch).
+The measured fix order is therefore: **(1)** allocate the 8-byte
+result buffer once and reuse it across launches instead of
+malloc/free per launch; **(2)** reduce launches per batch from
+three to one by choosing host batch sizes that are multiples of
+the alphabet size B (so batches stay group-aligned and the
+lead/trail generic segments vanish); **(3)** only then revisit
+checkpoint cadence and double-buffering. Each fix must be
+re-measured with this same end-to-end run.
+
+### Alphabet sweep (concluded)
+
+Length 8, interleave 2, block 256, device timing:
+
+| Alphabet | B | Hashes/s |
+|---|---|---|
+| `n` | 10 | 15.31 GH/s |
+| `l` | 26 | 17.54 GH/s |
+| `un` | 36 | 17.00 GH/s |
+| `uln` | 62 | 17.69 GH/s |
+
+Alphabet size is a second-order effect (~15% spread): B=10 loses
+~13% against B=62 because group preparation amortises over fewer
+candidates, and the MSSQL-relevant `un` (36) sits within 4% of the
+best. No alphabet-specific kernel work is justified by this.
 
 ### Autotuning
 
@@ -825,6 +927,35 @@ Profiling conclusions:
   multiplier axis (8/32/64 blocks/SM) already searches in this space.
   This, plus a grouped kernel for medium lengths, is where measured
   headroom remains — not in more interleaving.
+
+**Generic kernel at L17/L25 (Nsight Compute).** Both lengths:
+39 registers/thread, theoretical occupancy 75%, duration ~539 µs
+(L17) / ~554 µs (L25) per profiled 4.19M-candidate launch, and
+**SM (ALU) throughput ~86%** — Nsight calls the ALU
+"over-utilized". The generic kernel is therefore *also* ALU-bound,
+even more saturated than the fast kernel (76.6%). Its ~45% deficit
+against the fast kernels is consequently **not** a memory-stall
+story on this evidence: it executes materially more ALU
+instructions per candidate (per-candidate digit conversion,
+message build and repack, vs the fast kernel's per-group
+preparation amortised over B candidates plus a first-byte swap).
+A medium-length grouped kernel would win by removing those
+instructions, not by fixing a bandwidth problem. Caveat: the local
+load/store sector metrics requested for this export returned **no
+rows**, so local-memory traffic from the 576-byte stack frame is
+still unquantified — the ALU conclusion stands on SM throughput
+and duration only, and the local-traffic retry needs corrected
+metric names (`--set memory` / Memory Workload section). The
+`--set memory` retry at both lengths profiled successfully
+(reports saved), but its filtered details export again printed no
+metric lines, and a subsequent `--csv` export with SASS
+local-instruction metrics
+(`smsp__sass_thread_inst_executed_op_local_ld_pred_on.sum` and the
+`_st_` counterpart) also returned empty for both lengths. Local
+traffic therefore remains unquantified after three extraction
+attempts; stop guessing metric names — read the Memory Workload
+Analysis section directly from `ncu --import <rep> --page details`
+output (or the GUI) and record the Local Memory figures verbatim.
 
 ### 8.5 Notes and conclusions
 
