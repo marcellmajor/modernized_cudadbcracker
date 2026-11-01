@@ -99,6 +99,51 @@ cmake --version    # must be >= 3.24
 nvcc --version     # CUDA 12.x expected
 ```
 
+Notebook gotcha (observed in practice): each `!` line runs in its own
+shell, so `export PATH=...` in one cell does not reach `cmake` in the
+next, and the configure fails with "unable to find a build program
+corresponding to Ninja". Install Ninja onto the default PATH, or do
+install + configure + build in a single `!` chain:
+
+```bash
+# either, as root on a notebook image:
+apt-get install -y ninja-build
+# or:
+pip install ninja            # system install, lands on PATH
+which ninja && ninja --version
+
+# then, still in one shell invocation if PATH was a problem:
+pip install -q ninja && cmake --preset distribution 2>&1 | tee build_configure.log
+```
+
+If `pip show ninja` (or the package in
+`/root/.local/lib/python3.13/site-packages`) says Ninja is installed
+but CMake still reports "unable to find a build program corresponding
+to Ninja", the binary is simply not on the PATH CMake inherits. Fix
+by locating it and either symlinking it onto the PATH or naming it
+explicitly — `CMAKE_MAKE_PROGRAM` overrides the preset's generator
+search without editing any project file:
+
+```bash
+ls /root/.local/bin/ninja                                   # usual pip --user location
+python3 -c "import ninja, os; print(os.path.dirname(ninja.__file__))"
+# binary is at <that dir>/data/bin/ninja if the bin script is absent
+
+ln -sf /root/.local/bin/ninja /usr/local/bin/ninja && ninja --version
+# or, without touching PATH at all:
+cmake --preset distribution -DCMAKE_MAKE_PROGRAM=/root/.local/bin/ninja
+```
+
+Last resort, skip Ninja entirely with the Makefiles generator (same
+cache variables as the preset; label results as a manual configure,
+not the `distribution` preset):
+
+```bash
+cmake -S . -B build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;89-real;90-real;90-virtual" \
+  -DCUDADB_ENABLE_CUDA=ON
+```
+
 ### 3a. Full distribution build (validates all four architectures)
 
 This compiles native images for `sm_75;sm_80;sm_89;sm_90` plus PTX
@@ -376,20 +421,39 @@ measured facts.
 
 | Item | Value |
 |---|---|
-| Git commit (`git rev-parse HEAD`) | _(pending)_ |
-| Where run | _(pending)_ |
-| GPU (as reported) | _(pending — expected A100, cc 8.0)_ |
-| Driver / CUDA toolkit | _(pending)_ |
-| Build preset | _(pending)_ |
-| Architectures found in binary | _(pending)_ |
+| Git commit (`git rev-parse HEAD`) | _(pending — not yet reported)_ |
+| Where run | Not yet stated (Linux x86_64, kernel 6.6.159+, container host `938f62003527`; working directory `/content/modernized_cudadbcracker`) |
+| GPU (as reported) | NVIDIA A100-SXM4-80GB, compute capability 8.0, 80 GiB |
+| Driver / CUDA toolkit | Driver 580.82.07 / toolkit CUDA 13.0 (V13.0.88, `/usr/local/cuda/bin/nvcc`) |
+| Build preset | `distribution` — **build completed 23/23** (CMake 3.31.10, GNU 13.3.0 host compiler, nvcc 13.0.88), zero errors and zero warnings in the full log |
+| Architectures found in binary | All four native targets compiled: 98 kernel entries each for `sm_75`, `sm_80`, `sm_89`, `sm_90` (392 total, from `ptxas` records; `cuobjdump` confirmation still pending) |
+
+Environment notes (from the first returned output, `nvidia-smi` +
+`tools/check_environment.py`):
+
+- The GPU is exactly the expected target class: A100 SXM4 80 GB,
+  cc 8.0, idle at the time of capture (0 MiB used, no processes).
+- The toolkit is **CUDA 13.0**, newer than the CUDA 12.x baseline the
+  spec assumed. Watch the distribution build for architecture-support
+  warnings (notably around `sm_75`) and record them verbatim; a
+  deprecation warning is acceptable, a dropped architecture is not —
+  it would need reporting against spec section 3.
+- **Blocker found and worked around: `ninja` was not on PATH** on the
+  machine, and the CMake presets require the Ninja generator. The
+  pip `ninja` package (1.13.2) is installed under
+  `/root/.local/lib/python3.13/site-packages`; its binary must be
+  symlinked onto PATH or named via `-DCMAKE_MAKE_PROGRAM=...`
+  (see Step 3). `cmake` is confirmed at version **3.31.10**
+  (>= 3.24 as required), from the pip `cmake` package.
 
 ### 8.2 Tests
 
 | Check | Result |
 |---|---|
-| Host tests (`-L host`) | _(pending)_ |
-| `self-test --extended --device 0` | _(pending)_ |
-| `ctest -L gpu` / `test_gpu` | _(pending — must be Passed, not Skipped)_ |
+| Host tests (`-L host`) | **Passed** (3/3 on the A100 machine) |
+| `devices --json` | **Passed** — A100-SXM4-80GB, cc 8.0, 108 SMs, 84,994,825,984 bytes, max 1024 threads/block |
+| `self-test --extended --device 0` | **Passed** |
+| `ctest -L gpu` / `test_gpu` | **Attempt 1: FAILED — test bug, not a kernel failure.** Aborted with `candidate offset overflows the length space`. Root cause: the MSSQL search case used password `BA` (uppercase) over the lowercase alphabet `abc`, so no candidate could match; the scan then ran past the end of the length-2 space (batch count 27 > 3² = 9), where offset arithmetic correctly throws. Fixed in `tests/test_gpu.cpp` (case is now `ba`, and every case's batch count is bounded by `min(27, 3^L)`). The GPU digest section and the Oracle cases preceding it had already run without a mismatch report. Awaiting a rebuilt re-run. |
 | Synthetic search smoke test | _(pending)_ |
 
 ### 8.3 Benchmarks
@@ -406,10 +470,34 @@ measured facts.
 
 ### 8.5 Notes and conclusions
 
-_(To be written from the returned output: whether the CUDA code
-compiled cleanly for sm_75/80/89/90, whether GPU offsets match the CPU
-control everywhere including lengths 17/45/25 and interleave 4, which
-interleave/block configuration actually wins on A100 and by how much,
-whether register spills explain any loss, what profiling says the
-bottleneck is, and which previously "not tested" claims can now be
-closed — with any GPU not run still listed as untested.)_
+**Build (concluded).** The CUDA code compiles cleanly with nvcc 13.0
+for all four spec architectures. The full log (1,995 lines) contains
+no errors and no warnings. The configure log is likewise clean:
+preset variables exactly as specified, GNU 13.3.0 host compiler,
+nvcc 13.0.88, "Configuring done (6.1s)" — and notably **no `sm_75`
+deprecation or dropped-architecture warning under CUDA 13**, so the
+T4 target compiles without qualification on this toolkit. Register/spill summary from the `ptxas`
+records (392 kernel entries):
+
+- **Zero spill stores and zero spill loads on every variant.** The
+  register-resident redesign goal is met at compile time.
+- Fast kernels, interleave 1: 40–58 registers; interleave 2: 29–64;
+  interleave 4: 30–96 (maximum 96 on the largest `sm_75` variants).
+  Interleave 4's register cost is real but causes no spilling; whether
+  its lower occupancy still wins is a benchmark question.
+- Fast kernel stack frame is a constant 16 bytes; the generic search
+  kernel uses 40 registers with a 576-byte stack frame (its bounded
+  local staging arrays), and `digestKernel` 448 bytes — expected for
+  the generic path and the reason the fast path exists.
+- Constant memory use is 800 bytes (`cmem[0]`), consistent with the
+  `__grid_constant__` parameter block.
+
+This closes the "CUDA compilation" item previously listed as not
+tested for **all four architectures at compile level**. Execution is
+so far possible only on the A100 present; T4/L4/H100 remain
+execution-untested.
+
+_(Still to be written from returned output: whether GPU offsets match
+the CPU control everywhere including lengths 17/45/25 and interleave
+4, which interleave/block configuration actually wins on A100 and by
+how much, and what profiling says the bottleneck is.)_

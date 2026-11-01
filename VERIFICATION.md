@@ -57,11 +57,15 @@ and `tools/generate_vectors.py --table` reproduces the §14.1 table.
 
 ## What was NOT run
 
-- **CUDA compilation.** The `.cu` sources have not been compiled by
-  `nvcc` in this environment. They were written against the CUDA 12
-  runtime API and reviewed, but T4 (`sm_75`), A100 (`sm_80`), L4
-  (`sm_89`), and H100 (`sm_90`) images are **not tested** and must not
-  be represented as verified.
+- **CUDA compilation — now verified externally.** The distribution
+  build was compiled on an A100 machine with nvcc 13.0.88 / GNU 13.3
+  (CMake 3.31.10): 23/23 targets, zero errors/warnings, 98 kernel
+  entries per architecture for `sm_75`, `sm_80`, `sm_89`, `sm_90`,
+  and **zero register spills on all 392 entries** (fast kernels
+  29–96 registers by interleave; see `test_and_benchmark.md` section
+  8). This verifies *compilation* for all four architectures.
+  *Execution* is verified only where `test_gpu` has actually run;
+  T4, L4, and H100 execution remain **not tested**.
 - **Reusable stream (post-review change).** All kernel launches use a
   single process-wide named stream (`<<<grid, block, 0, stream()>>>`
   with `cudaStreamSynchronize`), per spec section 10. This change is
