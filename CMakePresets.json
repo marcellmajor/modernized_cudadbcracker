@@ -1,0 +1,36 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "host-only",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-host",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "CUDADB_ENABLE_CUDA": "OFF" }
+    },
+    {
+      "name": "distribution",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CUDADB_ENABLE_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "75-real;80-real;89-real;90-real;90-virtual"
+      }
+    },
+    {
+      "name": "native-dev",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-native",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "CUDADB_ENABLE_CUDA": "ON", "CMAKE_CUDA_ARCHITECTURES": "native" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "host-only", "configurePreset": "host-only" },
+    { "name": "distribution", "configurePreset": "distribution" },
+    { "name": "native-dev", "configurePreset": "native-dev" }
+  ],
+  "testPresets": [
+    { "name": "host", "configurePreset": "host-only", "filter": { "include": { "label": "host" } } }
+  ]
+}

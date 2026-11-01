@@ -1,0 +1,40 @@
+# Build output
+/build/
+/build-host/
+/build-native/
+*.o
+*.a
+
+# Run/test artifacts (regenerate with ctest / benchmark / tools)
+*.log
+*.jsonl
+*.ncu-rep
+*.qdrep
+bench_*.json
+benchmark_*.log
+profile_*
+timeline_*
+images.log
+smoke_*
+tuning_cache.txt
+*_checkpoint.json
+
+# Temporary notes from code-review rounds — kept locally, not tracked.
+# Add future round notes here instead of committing them.
+IMPLEMENTATION_SPECS_grok_amendment.md
+IMPLEMENTATION_SPECS_muse_amendment.md
+*_review_notes*.md
+*_amendment.md
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS noise
+*.swp
+*~
+.idea/
+.vscode/
