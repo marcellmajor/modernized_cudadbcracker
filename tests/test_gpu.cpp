@@ -37,7 +37,7 @@ int main() {
         {Algorithm::Oracle11g, {'c','a','b'}, saltO},
         {Algorithm::Oracle11g, {'a','a','a'}, saltO},
         {Algorithm::Oracle11g, {'c','c','c'}, saltO},
-        {Algorithm::Mssql, {'B','A'}, saltM},
+        {Algorithm::Mssql, {'b','a'}, saltM},
         // Medium lengths beyond the fast kernel (L>16): exercise the generic
         // single-block path (Oracle <=45, MSSQL <=25) against the CPU control.
         {Algorithm::Oracle11g, med(17, 'c'), saltO},
@@ -48,14 +48,19 @@ int main() {
     for (auto& c : cases) {
         Target t; t.label = "t"; t.salt = c.salt; t.digest = digestForCandidate(c.a, c.pw, c.salt);
         std::vector<std::uint8_t> base(c.pw.size(), 0);
-        auto cpu = cpuSearch(c.a, t, t.digest, alpha, base, 27);
-        auto gpu = gpuSearch(c.a, t, t.digest, alpha, base, 27, 0, cfg);
+        // Batch count bounded by the length space (3^L), capped at 27: a
+        // count beyond B^L asks for candidates that do not exist.
+        std::uint64_t count = 1;
+        for (std::size_t i = 0; i < c.pw.size() && count < 27; ++i) count *= 3;
+        if (count > 27) count = 27;
+        auto cpu = cpuSearch(c.a, t, t.digest, alpha, base, count);
+        auto gpu = gpuSearch(c.a, t, t.digest, alpha, base, count, 0, cfg);
         if (cpu != gpu) { std::cerr << "FAIL gpu search offset mismatch\n"; return 1; }
         LaunchConfig cfg2 = cfg; cfg2.interleave = 2;
-        auto gpu2 = gpuSearch(c.a, t, t.digest, alpha, base, 27, 0, cfg2);
+        auto gpu2 = gpuSearch(c.a, t, t.digest, alpha, base, count, 0, cfg2);
         if (cpu != gpu2) { std::cerr << "FAIL gpu search (interleave 2) offset mismatch\n"; return 1; }
         LaunchConfig cfg4 = cfg; cfg4.interleave = 4;
-        auto gpu4 = gpuSearch(c.a, t, t.digest, alpha, base, 27, 0, cfg4);
+        auto gpu4 = gpuSearch(c.a, t, t.digest, alpha, base, count, 0, cfg4);
         if (cpu != gpu4) { std::cerr << "FAIL gpu search (interleave 4) offset mismatch\n"; return 1; }
     }
     std::cout << "test_gpu passed\n";
