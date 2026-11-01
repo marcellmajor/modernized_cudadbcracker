@@ -336,8 +336,10 @@ ncu --set detailed \
 Repeat with `--interleave 2` and `--interleave 4`. Then inspect:
 
 ```bash
-ncu --import profile_ora_L8_il1.ncu-rep --page summary
 ncu --import profile_ora_L8_il1.ncu-rep --page details
+# compact numeric export (Nsight Compute 2025.x has no "summary" page):
+ncu --import profile_ora_L8_il1.ncu-rep --csv \
+  --metrics gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__registers_per_thread,sm__warps_active.avg.pct_of_peak_sustained_elapsed
 ```
 
 Extract for the Results section, per kernel:
@@ -453,20 +455,191 @@ Environment notes (from the first returned output, `nvidia-smi` +
 | Host tests (`-L host`) | **Passed** (3/3 on the A100 machine) |
 | `devices --json` | **Passed** — A100-SXM4-80GB, cc 8.0, 108 SMs, 84,994,825,984 bytes, max 1024 threads/block |
 | `self-test --extended --device 0` | **Passed** |
-| `ctest -L gpu` / `test_gpu` | **Attempt 1: FAILED — test bug, not a kernel failure.** Aborted with `candidate offset overflows the length space`. Root cause: the MSSQL search case used password `BA` (uppercase) over the lowercase alphabet `abc`, so no candidate could match; the scan then ran past the end of the length-2 space (batch count 27 > 3² = 9), where offset arithmetic correctly throws. Fixed in `tests/test_gpu.cpp` (case is now `ba`, and every case's batch count is bounded by `min(27, 3^L)`). The GPU digest section and the Oracle cases preceding it had already run without a mismatch report. Awaiting a rebuilt re-run. |
-| Synthetic search smoke test | _(pending)_ |
+| `ctest -L gpu` / `test_gpu` | **Passed** (0.55 s, after fast-forward to `b775209`). Attempt 1 had failed on a test-case bug — MSSQL case `BA` over a lowercase alphabet with batch 27 > 3² space — fixed in commit `4da1451` (case `ba`, counts bounded by `min(27, 3^L)`); the re-run passes all GPU digest checks (both algorithms, lengths 0–128 incl. multi-block) and all GPU-vs-CPU search-offset checks, including Oracle 17/45, MSSQL 17/25, at interleave 1, 2, and 4. |
+| Synthetic search smoke test | **Passed.** `verify --backend both` returned `found` (`verification":"both"`). The full `search` then ran end-to-end with exit 0 and emitted `{"status":"found","password_hex":"636162","password_display":"cab","rank":"678","verification":"cpu-verified"}` — rank 678 is exactly canonical for `cab` over the 26-letter alphabet (2 + 0·26 + 1·26²), so GPU batch search, CPU re-verification of the hit, checkpoint writing, and JSONL reporting all work together. (The first attempt had been interrupted by a notebook paste artifact in the long shell line, unrelated to the code.) |
 
 ### 8.3 Benchmarks
 
-| Algorithm | Length | Block | Interleave | Hashes/s | Registers | Spills | Kernel |
-|---|---|---|---|---|---|---|---|
-| _(pending)_ | | | | | | | |
+A100-SXM4-80GB, length 8, alphabet 62 (`uln`), 16,777,216 candidates,
+5 repeats, device-event timing (median). Registers/spills are from the
+build log's `ptxas` records (the benchmark JSON's
+`registers_per_thread` field currently reports -1; see note below).
+
+| Algorithm | Length | Block | Interleave | Hashes/s | vs best |
+|---|---|---|---|---|---|
+| ora11g | 8 | 256 | 2 | **17.71 GH/s** | best |
+| ora11g | 8 | 128 | 2 | 17.45 GH/s | −1.5% |
+| ora11g | 8 | 256 | 1 | 15.37 GH/s | −13% |
+| ora11g | 8 | 128 | 1 | 15.26 GH/s | −14% |
+| ora11g | 8 | 256 | 4 | 14.69 GH/s | −17% |
+| ora11g | 8 | 128 | 4 | 14.11 GH/s | −20% |
+| mssql | 8 | 256 | 2 | **17.25 GH/s** | best |
+| mssql | 8 | 128 | 2 | 17.16 GH/s | −0.5% |
+| mssql | 8 | 256 | 1 | 15.30 GH/s | −11% |
+| mssql | 8 | 128 | 1 | 15.26 GH/s | −11% |
+| mssql | 8 | 256 | 4 | 14.72 GH/s | −15% |
+| mssql | 8 | 128 | 4 | 14.03 GH/s | −19% |
+
+Conclusions so far:
+
+- **Interleave 2 is the winner** on A100 for both algorithms
+  (+13–15% over interleave 1). The extra independent state hides
+  round latency as designed.
+- **Interleave 4 loses** (−15–20% vs interleave 2) despite **zero
+  spills**. With up to 96 registers/thread its resident-warp count
+  drops (65,536 ÷ (96 × 32) ≈ 21 warps/SM vs ≈39 at 52 registers),
+  and the occupancy loss outweighs the ILP gain. This is the
+  register-pressure outcome predicted for factor 4; the tuner should
+  not select it on A100, and its value is now measured, not assumed.
+- Block 256 is consistently, slightly better than 128 (≤1.5%).
+- Oracle and MSSQL rates are within ~3% of each other, as expected:
+  same block count and round work at length 8, only the packing
+  differs.
+- Known reporting gap: the benchmark JSON prints
+  `registers_per_thread: -1` because `timeSearchLaunches` does not
+  query kernel attributes. The build log has the true values; wiring
+  `cudaFuncGetAttributes` into the benchmark record is a small
+  follow-up fix.
+
+### Length sweep (interleave 2, block 128)
+
+| Algorithm | Length | Kernel family | Hashes/s | Note |
+|---|---|---|---|---|
+| ora11g | 6 | fast | 16.84 GH/s | grouped fast kernel |
+| ora11g | 12 | fast | 17.37 GH/s | grouped fast kernel |
+| ora11g | 17 | generic | 9.45 GH/s | single-block generic |
+| ora11g | 25 | generic | 9.17 GH/s | single-block generic |
+| ora11g | 45 | generic | 8.61 GH/s | single-block boundary |
+| ora11g | 46 | generic | 5.17 GH/s | first multi-block length |
+| mssql | 6 | fast | 17.34 GH/s | grouped fast kernel |
+| mssql | 12 | fast | 17.19 GH/s | grouped fast kernel |
+| mssql | 17 | generic | 9.25 GH/s | single-block generic |
+| mssql | 25 | generic | 8.90 GH/s | single-block boundary |
+| mssql | 26 | generic | 5.27 GH/s | first multi-block length |
+
+Conclusions:
+
+- **The fast→generic cliff at length 17 costs ~45%.** Lengths
+  17–45 (Oracle) and 17–25 (MSSQL) are single-block messages handled
+  by the per-candidate generic path: full repack, digit conversion,
+  and the 576-byte local staging frame for every candidate, with no
+  group amortisation of salt/padding preparation. This is now
+  *measured* support for the previously held item B — a grouped
+  single-block kernel for medium lengths is the main remaining
+  performance lever, worth up to roughly 1.8× in that range if it
+  approaches fast-kernel efficiency.
+- Within the generic single-block range the decline with length is
+  gentle (Oracle 9.45 → 8.61 GH/s from L17 to L45): packing cost per
+  extra byte is small next to one compression.
+- Crossing to two blocks (Oracle 46, MSSQL 26) costs a further ~40%
+  (ratio ≈ 0.60, not 0.50, because per-candidate setup is amortised
+  across both compressions). This is inherent to SHA‑1, not a defect.
+- The generic kernel ignores the interleave setting (it has no
+  interleaved variant); the `interleave: 2` in these records is the
+  requested configuration, not an applied one.
+
+### Autotuning
+
+`--tune quick` and `--tune full` both complete (exit 0; wall 0.5 s /
+0.4 s including CUDA start-up and the length-3 search itself, at this
+small synthetic size). **Reporting gap:** the search output does not
+state which configuration tuning selected — the selection is only
+visible in the tuning cache file
+(`$HOME/.cache/cudadbcracker/tuning.txt`). Surfacing the chosen
+block/interleave/grid in the search log is a small follow-up fix.
+The cache contents are to be pasted here when collected:
+
+```text
+NVIDIA A100-SXM4-80GB|cc8.0|SM108|ora11g|L3|B26    128 1 32
+```
+
+Reading: for Oracle, length 3, alphabet 26, the tuner selected
+**block 128, interleave 1, grid multiplier 32** on this A100. That is
+one (length, alphabet) key from the small synthetic search, not a
+global tuning verdict — the length-8 benchmarks above remain the
+performance evidence, and they favour interleave 2 at that length.
+Different lengths legitimately tune differently; this line mainly
+proves the tune → cache → reuse path works end to end.
+
+Still pending: profiling.
 
 ### 8.4 Profiling
 
-| Kernel / interleave | Duration | Achieved occupancy | SM throughput | Top stall reason |
-|---|---|---|---|---|
-| _(pending)_ | | | | |
+Attempt 1 (Nsight Compute 2025.3.1): `ncu` attached successfully at
+all three interleave factors but reported **"No kernels were
+profiled"** — a launch-accounting mistake in the profiling command,
+not a permission error. The benchmark process launches the fast
+kernel only twice (one warm-up + `repeats=1`), and
+`--launch-skip 2` skipped both. No `ERR_NVGPUCTRPERM` was seen, so
+counter access is not (yet) proven blocked. Retry uses
+`--repeats 5` with `--launch-skip 1 --launch-count 3`. (Rates printed
+during the attempt, ~6 GH/s, are under profiler replay and are not
+comparable to the unprofiled benchmarks.)
+
+Attempt 2 (corrected launch count): **success.** `ncu` profiled
+`fastSearchKernel` 3× at each interleave factor (18 passes each) and
+wrote `/tmp/prof_il1.ncu-rep`, `/tmp/prof_il2.ncu-rep`,
+`/tmp/prof_il4.ncu-rep`. Counter access therefore works on this
+runtime — no permission blocker. (`--page summary` does not exist in
+Nsight Compute 2025.3; use `--page details` or `--csv`.)
+
+First extracted metrics, interleave 2 (details page):
+
+- Theoretical occupancy **62.5%** (40 active warps/SM; block limit is
+  registers at 10 blocks/SM), but **achieved occupancy only 14.1%**
+  (9.05 warps/SM). Nsight attributes the gap to load imbalance and
+  wave quantisation: the launch is 3 full waves plus a partial wave
+  of 217 blocks (up to ~25% of runtime in the tail), and SM active
+  cycles vary +39%/−20% around the mean.
+- DRAM activity is negligible (average 24.6 active cycles) — the
+  kernel is confirmed compute-bound with essentially no memory
+  traffic, as designed.
+- Branch efficiency 99.97%, divergent branches ~0 — divergence is
+  not a factor.
+
+The low achieved occupancy is the most interesting profiling fact so
+far: at 14% occupancy the kernel still reaches 17.5 GH/s, which
+means it is *not* latency-starved at this work size — per-warp ILP
+(interleave) plus the resident warps carry it. It also means the
+grid/wave shape (grid multiplier, batch size) has real headroom to
+test, since a better-balanced tail could reclaim part of that 25%.
+
+All values below are from the `.ncu-rep` CSV exports (Oracle, L8,
+block 128, grid 3456 blocks, 4,194,304 candidates per launch; three
+launches per factor, essentially identical):
+
+| Interleave | Registers/thread | Duration | SM throughput | Theoretical occupancy | Achieved occupancy | Partial-wave tail |
+|---|---|---|---|---|---|---|
+| 1 | 40 | 404 µs | **76.6%** (ALU-bound) | 75.0% | 26.8–27.2% | 864 blocks (33%) |
+| 2 | 48 | 470 µs | 57.1% | 62.5% | 14.1% | 217 blocks (25%) |
+| 4 | 72 | 515 µs | 52.1% | 43.8% | 10.4% | 432 blocks (20%) |
+
+Profiling conclusions:
+
+- **Interleave 1 is ALU-pipe-bound** (76.6% ALU utilisation, the
+  highest pipeline): the SHA‑1 integer mix itself is the limit, and
+  the compiler's instruction selection is working. There is no
+  memory, divergence, or occupancy mystery at this factor.
+- At interleave 2 and 4, SM throughput *drops* (57% / 52%) while
+  theoretical and achieved occupancy also drop with register count
+  (48 / 72 per thread). Under the profiler's controlled clocks the
+  per-launch durations actually run 1 < 2 < 4 — the **opposite**
+  order to the free-running 16.7M-candidate benchmarks, where
+  interleave 2 won. The benchmark ordering remains the throughput
+  evidence (real clocks, larger batches); the profiler establishes
+  *why* there is no large ILP win to be had: the ALU is already the
+  bottleneck at interleave 1, so extra independent states mostly buy
+  register pressure. Interleave 2's small free-running gain is
+  consistent with latency smoothing at boost clocks, not with a
+  fundamentally under-utilised pipeline.
+- **Every launch has a 20–33% partial-wave tail** at the tuned grid
+  (3,456 blocks). With 10 resident blocks/SM at interleave 2, one
+  wave is 1,080 blocks; grid sizes that are exact wave multiples
+  (e.g. 3,240 or 4,320 blocks at this configuration) are the
+  concrete next tuning experiment, and the `--tune full` grid
+  multiplier axis (8/32/64 blocks/SM) already searches in this space.
+  This, plus a grouped kernel for medium lengths, is where measured
+  headroom remains — not in more interleaving.
 
 ### 8.5 Notes and conclusions
 
@@ -493,11 +666,24 @@ records (392 kernel entries):
   `__grid_constant__` parameter block.
 
 This closes the "CUDA compilation" item previously listed as not
-tested for **all four architectures at compile level**. Execution is
-so far possible only on the A100 present; T4/L4/H100 remain
-execution-untested.
+tested for **all four architectures at compile level**.
 
-_(Still to be written from returned output: whether GPU offsets match
-the CPU control everywhere including lengths 17/45/25 and interleave
-4, which interleave/block configuration actually wins on A100 and by
-how much, and what profiling says the bottleneck is.)_
+**GPU execution (concluded on A100).** `test_gpu` passes on the
+A100-SXM4-80GB: every GPU digest equals the CPU reference for both
+algorithms at lengths 0, 1, 10, 12, 25/26, 45, and 128, and every
+GPU search returns exactly the CPU search offset — for the grouped
+fast kernels, the generic path, the medium single-block lengths
+(Oracle 17 and 45, MSSQL 17 and 25), and interleave factors 1, 2,
+and 4. The earlier "GPU code is correct by inspection only" caveat
+is therefore closed for the A100. T4, L4, and H100 **execution**
+remain untested (their images compile; nothing has run on them).
+
+**Overall status.** The runbook is complete for the A100: build,
+compilation for all four architectures, host and GPU tests, the
+end-to-end smoke search, benchmarks (interleave 2 / block 256 wins;
+17.7 GH/s peak at length 8), the length sweep (fast→generic cliff at
+L17, the main remaining optimisation lever), autotuning, and
+profiling (ALU-bound at interleave 1; wave-tail headroom in grid
+shape). Remaining open items are only: multi-batch/interruption behaviour
+on GPU, execution on T4/L4/H100, and the held medium-length grouped
+kernel.

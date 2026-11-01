@@ -66,20 +66,31 @@ and `tools/generate_vectors.py --table` reproduces the §14.1 table.
   8). This verifies *compilation* for all four architectures.
   *Execution* is verified only where `test_gpu` has actually run;
   T4, L4, and H100 execution remain **not tested**.
-- **Reusable stream (post-review change).** All kernel launches use a
-  single process-wide named stream (`<<<grid, block, 0, stream()>>>`
-  with `cudaStreamSynchronize`), per spec section 10. This change is
-  source-reviewed only; like the rest of the CUDA path it awaits nvcc
-  compilation on a CUDA machine.
-- **GPU tests.** `test_gpu` (GPU digest agreement incl. MSSQL 10–12 and
-  multi-block lengths; GPU vs CPU search offsets for generic/fast and
-  interleave 1/2/4, plus medium single-block lengths Oracle 17/45 and
-  MSSQL 17/25) is implemented but skipped here for lack of a device.
-- **Benchmarks and autotuning.** No hashes/second numbers exist yet.
-  See `benchmarks/README.md` for the measurement protocol.
-- **The full GPU search loop** (`runSearch` with GPU batches,
-  checkpointing between batches, interruption) is exercised only up to
-  the explicit CUDA-unavailable error on this machine.
+- **Reusable stream.** All kernel launches use a single process-wide
+  named stream (`<<<grid, block, 0, stream()>>>` with
+  `cudaStreamSynchronize`), per spec section 10. Compiled with the
+  distribution build above and exercised by the passing `test_gpu`.
+- **GPU tests — passed on A100.** `test_gpu` passes on an
+  A100-SXM4-80GB (commit `b775209`): GPU digest agreement incl.
+  MSSQL 10–12 and multi-block lengths, and GPU vs CPU search offsets
+  for generic/fast kernels at interleave 1/2/4, including medium
+  single-block lengths Oracle 17/45 and MSSQL 17/25. Host tests and
+  `self-test --extended --device 0` also pass on that machine.
+  Execution on T4, L4, and H100 remains **not tested**.
+- **Benchmarks — first numbers on A100.** Length 8, alphabet 62,
+  device-event timing: interleave 2 / block 256 is fastest for both
+  algorithms (Oracle 17.71 GH/s, MSSQL 17.25 GH/s); interleave 1 is
+  ~13% slower and interleave 4 is 15–20% slower despite zero spills
+  (register-limited occupancy at up to 96 registers/thread). Full
+  table and analysis in `test_and_benchmark.md` section 8.3.
+  Autotuning runs, the length sweep, and profiling are still
+  outstanding; no other GPU has benchmark numbers.
+- **The GPU search loop** is exercised end-to-end on the A100: the
+  synthetic Oracle search found `cab` at the canonical rank 678 with
+  CPU re-verification, checkpoint, and JSONL output (see
+  `test_and_benchmark.md` Step 4.3 results). Multi-batch checkpoint
+  cadence over a long search and signal interruption on GPU have not
+  been separately exercised.
 
 ## Post-review optimisations (unmeasured)
 

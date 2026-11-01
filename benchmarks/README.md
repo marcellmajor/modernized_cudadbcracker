@@ -1,7 +1,12 @@
 # Benchmarks
 
-No benchmark numbers are reported yet: this development machine has no
-NVIDIA GPU, and unmeasured GPUs must not be represented as verified
+First measured results exist for one GPU (A100-SXM4-80GB, CUDA 13.0,
+driver 580.82.07; full records and context in
+`test_and_benchmark.md` section 8). Headlines, length 8, alphabet 62,
+device-event timing: fast kernels reach **17.7 GH/s** (interleave 2,
+block 256); single-block generic lengths 17–45 run at 8.6–9.5 GH/s;
+the first multi-block lengths at ~5.2 GH/s. No other GPU has numbers;
+unmeasured GPUs must not be represented as verified
 (spec sections 11, 15).
 
 On a permitted CUDA runtime, collect measurements with:
